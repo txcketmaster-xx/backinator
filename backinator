@@ -1,0 +1,402 @@
+#!/bin/env perl
+
+# ===========================================================================
+#  $Id$
+#
+#  backinator -- A simple, flexible tool for managing multiple rsync, tar
+#                mysql or subversion backups.
+#
+#  Usage: backinator [OPTIONS]
+#
+#  Rafi Khardalian <rafi|at|ticketmaster.com> -- Wed Jun 17 15:03:31 PDT 2009
+#
+# ===========================================================================
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# (C) Copyright Ticketmaster, Inc. 2009
+# ===========================================================================
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(:config bundling);
+use Sys::Syslog qw(:standard :macros);
+use POSIX qw(strftime);
+use File::Basename;
+use File::Glob qw(:globally);
+
+use constant YES => 1;
+use constant NO => 0;
+
+my $errors = 0;
+my %opts;
+
+GetOptions(\%opts,
+    'debug|d',
+    'configfile|c=s',
+    'quiet|q',
+    'help|h',
+    'usage|u',
+) || die("ERROR: Invalid options");
+
+usage() if (exists $opts{help} or (exists $opts{usage}));
+
+my $c = new Config(
+    plog => \&plog,
+    configfile => $opts{configfile},
+);
+
+openlog(basename($0), "ndelay,pid", "daemon");
+
+for my $job ( @{$c->getval('main.jobs', undef, YES)} )
+{
+    my $dst = strftime($c->getval("$job.dst", undef, NO, YES), localtime);
+    my $job_type = lc($c->getval("$job.type", undef, NO, YES));
+    my @job_cmds;
+
+    if ($job_type eq "rsync")
+    {
+        push(@job_cmds, gen_rsync($job, $dst));
+    }
+    elsif ($job_type eq "tgz")
+    {
+        push(@job_cmds, gen_tgz($job, $dst));
+    }
+    elsif ($job_type eq "mysql")
+    {
+        push(@job_cmds, @{gen_mysql($job, $dst)});
+    }
+    elsif ($job_type eq "svn")
+    {
+        push(@job_cmds, gen_svn($job, $dst));
+    }
+
+    else
+    {
+        plog(LOG_CRIT, "Destination is an unknown type [$dst], exiting.", 10);
+    }
+
+    plog(LOG_INFO, "[$job] Starting $job_type backup");
+
+    my $job_errors = 0;
+    for my $job_cmd (@job_cmds)
+    {
+        plog(LOG_DEBUG, "Running command [$job_cmd]\n");
+        my $result = exec_cmd($job, $job_cmd);
+        $job_errors += 1 if (defined $result);
+        $errors += $job_errors;
+    }
+
+    plog(LOG_INFO, "[$job] Completed with $job_errors errors.");
+}
+
+exit $errors;
+
+
+sub exec_cmd
+{
+    my $job = shift;
+    my $cmd = shift;
+
+    $cmd .= '; exit $PIPESTATUS';
+
+    my $result = `$cmd`;
+    if ($? > 0)
+    {
+        plog(LOG_CRIT, "[$job] Failed to execute [$?]");
+        return $result;
+    }
+
+    return undef;
+}
+
+
+sub gen_rsync
+{
+    my $job = shift;
+    my $dst = shift;
+
+    my @src = @{$c->getval("$job.src", undef, YES, NO)};
+    my $src_list = join(" ", map { glob() } @src);
+
+    mkdir_p($dst) if $c->getval("$job.create_dst", 1);
+    my $rsync_bin = $c->getval("main.rsync_bin");
+    my $rsync_opts = $c->getval("$job.rsync_opts",
+        "defaults.rsync_opts", NO, YES);
+
+    my $job_cmd = "$rsync_bin $rsync_opts $src_list $dst";
+    return $job_cmd;
+}
+
+
+sub gen_tgz
+{
+    my $job = shift;
+    my $dst = shift;
+
+    my @src = @{$c->getval("$job.src", undef, YES, NO)};
+    my $src_list = join(" ", map { glob() } @src);
+
+    my $tar_bin = $c->getval("main.tar_bin");
+    my $tar_opts = $c->getval("$job.tar_opts",
+        "defaults.tar_opts", NO, YES);
+
+    mkdir_p(dirname($dst)) if $c->getval("$job.create_dst", 1);
+
+    my $job_cmd = "$tar_bin $tar_opts $dst $src_list";
+    return $job_cmd;
+}
+
+
+sub gen_mysql
+{
+    my $job = shift;
+    my $dst = shift;
+
+    my (@job_cmd, @databases);
+    my $user = "";
+    my $pass = "";
+
+    unless ($c->getval("$job.user") eq "none")
+    {
+        $user = "-u " . $c->getval("$job.user");
+    }
+    unless ($c->getval("$job.pass") eq "none")
+    {
+        $pass = "--password=" . $c->getval("$job.pass");
+    }
+
+    my $all_cmd = 'echo "show databases" |'
+                . $c->getval("main.mysql_bin", undef, NO, YES)
+                . " -ss $user $pass";
+
+    my $dst_dn = dirname($dst);
+    my $dst_bn = basename($dst);
+
+    if (lc($c->getval("$job.databases", undef, NO, YES)) eq "all")
+    {
+        my $result = `$all_cmd`;
+        if ($? > 0)
+        {
+            plog(LOG_CRIT, "Could not obtain database list [$result]", 1);
+        }
+
+        @databases = split(/\n/, $result);
+    }
+    else
+    {
+        @databases = @{$c->getval("$job.databases", undef, YES, YES)};
+    }
+
+    for my $db ( @databases )
+    {
+        my $src = $c->getval("main.mysqldump_bin", undef, NO, YES)
+                . " $user $pass $db";
+
+        my $gzip_dst = gen_gzip($job, "$dst_dn/$db-$dst_bn");
+        push(@job_cmd, "$src | $gzip_dst");
+    }
+
+    return \@job_cmd;
+}
+
+
+sub gen_svn
+{
+    my $job = shift;
+    my $dst = shift;
+
+    my $repo = $c->getval("$job.repo", undef, NO, YES);
+    my $svnadmin_opts = $c->getval("$job.svnadmin_opts",
+        "defaults.svnadmin_opts", NO, YES);
+
+    my $src = $c->getval("main.svnadmin_bin", undef, NO, YES)
+                . " dump $svnadmin_opts $repo";
+    $dst = gen_gzip($job, $dst);
+
+    my $job_cmd = "$src | $dst";
+    return $job_cmd;
+}
+
+
+
+sub gen_gzip
+{
+    my $job = shift;
+    my $dst = shift;
+
+    my $gzip_bin = $c->getval("main.gzip_bin");
+    my $gzip_opts = $c->getval("$job.gzip_opts",
+        "defaults.gzip_opts", NO, YES);
+
+    mkdir_p(dirname($dst)) if $c->getval("$job.create_dst", 1);
+
+    my $gzip_cmd = "$gzip_bin $gzip_opts > $dst";
+    return $gzip_cmd;
+}
+
+
+sub mkdir_p
+{
+    my $dir = shift;
+    my $perm = shift || 0755;
+
+    my $part = "";
+    for my $piece (split(/\//, $dir))
+    {
+        $part = $part . "/" . $piece;
+        $part =~ s@//@/@g;
+        mkdir($part, $perm) unless (-d "$dir");
+    }
+
+    if (-d $dir)
+    { return 1; }
+
+    return 0;
+}
+
+
+sub plog
+{
+    my ($level, $msg, $exit_code) = @_;
+
+    my $appname = basename($0);
+    $msg =~ s/\n/\. /g;
+
+    unless (exists $opts{quiet})
+    {
+        print $appname . ": $msg\n"
+            if ($level <= $c->getval('main.loglevel'));
+    }
+
+    syslog($level, $msg);
+
+    if (defined $exit_code)
+    {
+        syslog(LOG_CRIT, "Exiting due to critical error");
+        exit $exit_code;
+    }
+}
+
+
+sub usage
+{
+    print STDERR (<<EOF);
+
+backinator -- A simple, flexible tool for managing multiple rsync, tar
+              mysql or subversion backups.
+
+Usage: backinator [OPTIONS]
+
+    -c, --configfile <file>
+                Full path to the backinator configuration file.  Specifying
+                this on the command line overrides looking in the default
+                locations, which are /etc/backinator.conf and the current
+                working directory.
+
+    -q, --quiet
+                Product no output to STDOUT, only syslog.  This is typically
+                what you will want when you call the script out of crontab.
+
+    -h, --help
+                If this is not obvious then you have bigger problems than
+                whether your data is backed up properly or not.
+
+    -d, --debug
+                Debugging mode. 
+
+EOF
+    exit 0;
+}
+
+package Config;
+
+use strict;
+use Config::Simple;
+use File::Basename;
+use Sys::Syslog qw(:macros);
+
+sub new
+{
+    my $class = shift;
+    my %args = @_;
+    my $configfile;
+
+    my $self = bless {
+        %args
+    }, $class;
+
+    # Look for our configuration file in sensible locations, always
+    # using one specified on the command line first.
+
+    $self->{appname} = basename($0) . ".conf";
+
+    if (defined $self->{configfile})
+    {
+        die ("ERROR: Invalid config file specified \"$self->{configfile}\"")
+            unless (-f $self->{configfile});
+
+        $configfile = $self->{configfile};
+    }
+    elsif (-f "/etc/" . $self->{appname})
+    {
+        $configfile = "/etc/" . $self->{appname};
+    }
+    elsif (-f $self->{appname})
+    {
+        $configfile = $self->{appname};
+    }
+    else
+    {
+        die "ERROR: Could not find maelosBackup.conf"
+    }
+
+    $self->{conf} = new Config::Simple(
+        filename => $configfile,
+        syntax   => "ini",
+    );
+
+    return $self;
+}
+
+
+sub getval
+{
+    my $self = shift;
+    my $key = shift;
+    my $default = shift;
+    my $want_arrayref = shift || 0;
+    my $required = shift || 0;
+
+    my $value;
+    $value = $self->{conf}->param($key);
+    if ( (not defined $value) and (defined $default) )
+    {
+        $value = $self->{conf}->param($default);
+    }
+
+    if (( not defined $value) and ($required) )
+    {
+        $self->{plog}->(LOG_ERR,
+            "Missing required configuration parameter [$key] -- exiting.", 1);
+    }
+
+    if ( ($want_arrayref) and (ref $value ne 'ARRAY') )
+    {
+        $value = [$value];
+    }
+
+    return $value;
+}
+
+1;
