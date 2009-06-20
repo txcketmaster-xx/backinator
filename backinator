@@ -58,12 +58,25 @@ my $c = new Config(
 
 openlog(basename($0), "ndelay,pid", "daemon");
 
+# Main program loop.
 for my $job ( @{$c->getval('main.jobs', undef, YES)} )
 {
+    # Support strftime in destinations.  Eventually will be refactored
+    # so that it is not passed around to every sub. 
     my $dst = strftime($c->getval("$job.dst", undef, NO, YES), localtime);
     my $job_type = lc($c->getval("$job.type", undef, NO, YES));
     my @job_cmds;
 
+    # Functionality for executing an arbitrary command before the
+    # primary job runs.
+    if ($c->getval("$job.pre"))
+    {
+        plog(LOG_DEBUG, "[$job] Added pre-execution command");
+	push(@job_cmds, strftime($c->getval("$job.pre"), localtime));
+    }
+
+    # Call functions for generating the commands needed for a particular
+    # type of backup job.
     if ($job_type eq "rsync")
     {
         push(@job_cmds, gen_rsync($job, $dst));
@@ -80,26 +93,45 @@ for my $job ( @{$c->getval('main.jobs', undef, YES)} )
     {
         push(@job_cmds, gen_svn($job, $dst));
     }
-
     else
     {
-        plog(LOG_CRIT, "Destination is an unknown type [$dst], exiting.", 10);
+        plog(LOG_CRIT, "Destination is an unknown type [$dst], exiting", 10);
+    }
+
+    # Functionality for executing an arbitrary command after the
+    # primary job runs.
+    if ($c->getval("$job.post"))
+    {
+        plog(LOG_DEBUG, "[$job] Added post-execution command");
+	push(@job_cmds, strftime($c->getval("$job.post"), localtime));
     }
 
     plog(LOG_INFO, "[$job] Starting $job_type backup");
 
+    # The execution of each job returns the number of errors encountered.
+    # Any single command erroring increments the job error counter by 1.
+    # We then report on the errors and optionally exit if stop_on_error is
+    # defined for the job in question.
     my $job_errors = 0;
     for my $job_cmd (@job_cmds)
     {
-        plog(LOG_DEBUG, "Running command [$job_cmd]\n");
+        plog(LOG_DEBUG, "[$job] Running command [$job_cmd]\n");
         my $result = exec_cmd($job, $job_cmd);
         $job_errors += 1 if (defined $result);
         $errors += $job_errors;
     }
 
-    plog(LOG_INFO, "[$job] Completed with $job_errors errors.");
+    plog(LOG_INFO, "[$job] Completed with $job_errors errors");
+
+    # When stop_on_error is specified for any job, we will exit
+    # and stop processing any more jobs.
+    if (($c->getval("$job.stop_on_error")) and ($job_errors > 0))
+    {
+	plog(LOG_CRIT, "[$job] Stopping execution of subsequent jobs", 500);
+    }
 }
 
+closelog();
 exit $errors;
 
 
@@ -108,6 +140,11 @@ sub exec_cmd
     my $job = shift;
     my $cmd = shift;
 
+    # This is magic.  PIPESTATUS contains the return code (bash array) of 
+    # all commands executed via pipes.  Otherwise, we would only get the
+    # return code of the last command to execute.  We need all of them so 
+    # we can determine whether mysqldump or svnadmin failed before getting
+    # to gzip.
     $cmd .= '; exit $PIPESTATUS';
 
     my $result = `$cmd`;
@@ -127,9 +164,16 @@ sub gen_rsync
     my $dst = shift;
 
     my @src = @{$c->getval("$job.src", undef, YES, NO)};
-    my $src_list = join(" ", map { glob() } @src);
 
-    mkdir_p($dst) if $c->getval("$job.create_dst", 1);
+    # Take our src_list and expand each element with glob, then pass it through
+    # strftime, flatten the array using whitespaces and return the whole thing
+    # as a string.
+
+    # Not proud of the Perl golf here, 4 under par.  It will be refactored
+    # eventually along with not passing dst.
+    my $src_list = join(" ", map { glob(); strftime($_, localtime) } @src);
+
+    mkdir_p($dst) unless $c->getval("$job.no_create_dst");
     my $rsync_bin = $c->getval("main.rsync_bin");
     my $rsync_opts = $c->getval("$job.rsync_opts",
         "defaults.rsync_opts", NO, YES);
@@ -145,13 +189,20 @@ sub gen_tgz
     my $dst = shift;
 
     my @src = @{$c->getval("$job.src", undef, YES, NO)};
-    my $src_list = join(" ", map { glob() } @src);
+
+    # Take our src_list and expand each element with glob, then pass it through
+    # strftime, flatten the array using whitespaces and return the whole thing
+    # as a string.
+
+    # Not proud of the Perl golf here, 4 under par.  It will be refactored
+    # eventually along with not passing dst.
+    my $src_list = join(" ", map { glob(); strftime($_, localtime) } @src);
 
     my $tar_bin = $c->getval("main.tar_bin");
     my $tar_opts = $c->getval("$job.tar_opts",
         "defaults.tar_opts", NO, YES);
 
-    mkdir_p(dirname($dst)) if $c->getval("$job.create_dst", 1);
+    mkdir_p(dirname($dst)) unless $c->getval("$job.no_create_dst", 1);
 
     my $job_cmd = "$tar_bin $tar_opts $dst $src_list";
     return $job_cmd;
@@ -167,6 +218,9 @@ sub gen_mysql
     my $user = "";
     my $pass = "";
 
+    # Construct the mysqldump command to use.  We do not want to pass
+    # the -u or --password options unless they need to be there.  In fact
+    # the keyword "none" must be used to avoid empty arguments.
     unless ($c->getval("$job.user") eq "none")
     {
         $user = "-u " . $c->getval("$job.user");
@@ -176,6 +230,8 @@ sub gen_mysql
         $pass = "--password=" . $c->getval("$job.pass");
     }
 
+    # If the "all" keyword is used for the 'databases' parameter, we
+    # connect to mysql to obtain a list of all databases within the instance.
     my $all_cmd = 'echo "show databases" |'
                 . $c->getval("main.mysql_bin", undef, NO, YES)
                 . " -ss $user $pass";
@@ -183,6 +239,7 @@ sub gen_mysql
     my $dst_dn = dirname($dst);
     my $dst_bn = basename($dst);
 
+    # Continued processing of the "all" keyword.
     if (lc($c->getval("$job.databases", undef, NO, YES)) eq "all")
     {
         my $result = `$all_cmd`;
@@ -190,7 +247,6 @@ sub gen_mysql
         {
             plog(LOG_CRIT, "Could not obtain database list [$result]", 1);
         }
-
         @databases = split(/\n/, $result);
     }
     else
@@ -198,6 +254,9 @@ sub gen_mysql
         @databases = @{$c->getval("$job.databases", undef, YES, YES)};
     }
 
+    # Separately dump each mysql database into a unique file.  The
+    # destination filename is NOT literal.  We split out the basename
+    # and append the name of the database being backed up to the filename.
     for my $db ( @databases )
     {
         my $src = $c->getval("main.mysqldump_bin", undef, NO, YES)
@@ -239,7 +298,7 @@ sub gen_gzip
     my $gzip_opts = $c->getval("$job.gzip_opts",
         "defaults.gzip_opts", NO, YES);
 
-    mkdir_p(dirname($dst)) if $c->getval("$job.create_dst", 1);
+    mkdir_p(dirname($dst)) unless $c->getval("$job.no_create_dst");
 
     my $gzip_cmd = "$gzip_bin $gzip_opts > $dst";
     return $gzip_cmd;
@@ -358,7 +417,7 @@ sub new
     }
     else
     {
-        die "ERROR: Could not find maelosBackup.conf"
+        die "ERROR: Could not find config file"
     }
 
     $self->{conf} = new Config::Simple(
@@ -385,10 +444,10 @@ sub getval
         $value = $self->{conf}->param($default);
     }
 
-    if (( not defined $value) and ($required) )
+    if ( (not defined $value) and ($required) )
     {
         $self->{plog}->(LOG_ERR,
-            "Missing required configuration parameter [$key] -- exiting.", 1);
+            "Missing required configuration parameter [$key] -- exiting", 1);
     }
 
     if ( ($want_arrayref) and (ref $value ne 'ARRAY') )
