@@ -34,18 +34,21 @@ use Sys::Syslog qw(:standard :macros);
 use POSIX qw(strftime);
 use File::Basename;
 use File::Glob qw(:globally);
+use File::Temp;
 
 use constant YES => 1;
 use constant NO => 0;
 
 my $errors = 0;
 my %opts;
+my $jobs;
 
 GetOptions(\%opts,
     'debug|d',
     'configfile|c=s',
     'quiet|q',
     'help|h',
+    'job=s@',
     'usage|u',
 ) || die("ERROR: Invalid options");
 
@@ -58,8 +61,11 @@ my $c = new Config(
 
 openlog(basename($0), "ndelay,pid", "daemon");
 
+$jobs = $c->getval('main.jobs', undef, YES);
+$jobs = $opts{job} if (exists $opts{job});
+
 # Main program loop.
-for my $job ( @{$c->getval('main.jobs', undef, YES)} )
+for my $job ( @{$jobs} )
 {
     # Support strftime in destinations.  Eventually will be refactored
     # so that it is not passed around to every sub. 
@@ -93,6 +99,11 @@ for my $job ( @{$c->getval('main.jobs', undef, YES)} )
     {
         push(@job_cmds, gen_svn($job, $dst));
     }
+    elsif ($job_type eq "ejabberd")
+    {
+        push(@job_cmds, gen_ejabberd($job, $dst));
+    }
+
     else
     {
         plog(LOG_CRIT, "Destination is an unknown type [$dst], exiting", 10);
@@ -288,6 +299,21 @@ sub gen_svn
 }
 
 
+sub gen_ejabberd
+{
+    my $job = shift;
+    my $dst = shift;
+
+    my $tmpdir = $c->getval("$job.tmpdir");
+    my $tmpfile = mktemp("$tmpdir/ejabberd.XXXXXX");
+    my $src = $c->getval("main.ejabberdctl_bin", undef, NO, YES)
+                . " dump $tmpfile";
+    $dst = gen_gzip($job, $dst);
+
+    my $job_cmd = "$src && cat $tmpfile | $dst ; rm $tmpfile";
+    return $job_cmd;
+}
+
 
 sub gen_gzip
 {
@@ -362,7 +388,11 @@ Usage: backinator [OPTIONS]
                 this on the command line overrides looking in the default
                 locations, which are /etc/backinator.conf and the current
                 working directory.
-
+    -j, --job
+		Execute a specific job or set of jobs.  This argument can
+		be issued multiple times, representing each job which should
+		be run.  It will also cause the "jobs" parameter in the config
+		file to be ignored.
     -q, --quiet
                 Product no output to STDOUT, only syslog.  This is typically
                 what you will want when you call the script out of crontab.
