@@ -61,6 +61,12 @@ my $c = new Config(
 
 openlog(basename($0), "ndelay,pid", "daemon");
 
+# Debug mode is... debug.
+if (exists $opts{debug})
+{
+    $c->{conf}->param('main.loglevel', '7');
+}
+
 $jobs = $c->getval('main.jobs', undef, YES);
 $jobs = $opts{job} if (exists $opts{job});
 
@@ -399,10 +405,6 @@ sub plog
             if ($level <= $c->getval('main.loglevel'));
     }
 
-    if (exists $opts{debug})
-    {
-	print "$msg\n";
-    }
     syslog($level, $msg);
 
     if (defined $exit_code)
