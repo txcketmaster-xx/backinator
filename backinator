@@ -103,6 +103,10 @@ for my $job ( @{$jobs} )
     {
         push(@job_cmds, gen_ejabberd($job, $dst));
     }
+    elsif ($job_type eq "kerberos")
+    {
+	push(@job_cmds, gen_kerberos($job, $dst));
+    }
 
     else
     {
@@ -280,6 +284,37 @@ sub gen_mysql
     return \@job_cmd;
 }
 
+sub gen_kerberos
+{
+    my $job = shift;
+    my $dst = shift;
+
+    my (@job_cmd, @realms);
+
+    # We need to get ur kdb5_util binary and options.
+    my $kdb5_bin = $c->getval("main.kdb5_util_bin", undef, NO, YES);
+    my $kdb5_opts = $c->getval("$job.kdb5_util_opts",
+        "defaults.kdb5_util_opts", NO, YES);
+
+    # Figure out our destination.
+    my $dst_dn = dirname($dst);
+    my $dst_bn = basename($dst);
+
+    # Grab the list of realms and dump each one to a unique file.
+    # The destination filename is NOT litteral. We split out the basename
+    # and append the name of the realm being backed up to the filename.
+    @realms = @{$c->getval("$job.realms", undef, YES, YES)};
+    for my $realm ( @realms )
+    {
+        my $src = "$kdb5_bin -r $realm dump";
+        my $gzip_dst = gen_gzip($job, "$dst_dn/$realm-$dst_bn");
+        push(@job_cmd, "$src | $gzip_dst");
+    }
+
+    return @job_cmd;
+
+}
+
 
 sub gen_svn
 {
@@ -364,6 +399,10 @@ sub plog
             if ($level <= $c->getval('main.loglevel'));
     }
 
+    if (exists $opts{debug})
+    {
+	print "$msg\n";
+    }
     syslog($level, $msg);
 
     if (defined $exit_code)
@@ -379,7 +418,7 @@ sub usage
     print STDERR (<<EOF);
 
 backinator -- A simple, flexible tool for managing multiple rsync, tar
-              mysql or subversion backups.
+              mysql, ejabberd, kerberos, or subversion backups.
 
 Usage: backinator [OPTIONS]
 
