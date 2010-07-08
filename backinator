@@ -1,4 +1,4 @@
-#!/bin/env perl
+#!/usr/bin/env perl
 
 # ===========================================================================
 #  $Id$
@@ -35,6 +35,7 @@ use POSIX qw(strftime);
 use File::Basename;
 use File::Glob qw(:globally);
 use File::Temp;
+use Fcntl qw(:flock);
 
 use constant YES => 1;
 use constant NO => 0;
@@ -46,6 +47,7 @@ my $jobs;
 GetOptions(\%opts,
     'debug|d',
     'configfile|c=s',
+    'lockfile|l=s',
     'quiet|q',
     'help|h',
     'job=s@',
@@ -60,6 +62,12 @@ my $c = new Config(
 );
 
 openlog(basename($0), "ndelay,pid", "daemon");
+my $lockfile = $c->getval("main.lockfile", "/tmp/backinator.lock", NO, YES);
+open(LOCKFILE, "> $lockfile");
+unless ( flock(LOCKFILE, LOCK_EX|LOCK_NB) )
+{
+    plog(LOG_CRIT, "Could not get exclusive lock, exiting", 10);
+}
 
 # Debug mode is... debug.
 if (exists $opts{debug})
@@ -152,6 +160,7 @@ for my $job ( @{$jobs} )
     }
 }
 
+flock(LOCKFILE, LOCK_UN);
 closelog();
 exit $errors;
 
@@ -429,11 +438,16 @@ Usage: backinator [OPTIONS]
                 this on the command line overrides looking in the default
                 locations, which are /etc/backinator.conf and the current
                 working directory.
+
     -j, --job
 		Execute a specific job or set of jobs.  This argument can
 		be issued multiple times, representing each job which should
 		be run.  It will also cause the "jobs" parameter in the config
 		file to be ignored.
+
+    -l, --lockfile <file>
+		Path to lock file.
+
     -q, --quiet
                 Product no output to STDOUT, only syslog.  This is typically
                 what you will want when you call the script out of crontab.
